@@ -1,5 +1,10 @@
 # makefun-aggregator
 
+[![make.fun · free-model-aggregator-02](https://make.fun/badge/free-model-aggregator-02.svg)](https://make.fun/bounty/free-model-aggregator-02?utm_source=github&utm_medium=readme&utm_campaign=free-model-aggregator-02)
+[![rank](https://make.fun/badge/free-model-aggregator-02/JEPEHHH/makefun-aggregator/rank.svg)](https://make.fun/bounty/free-model-aggregator-02/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=free-model-aggregator-02)
+[![reward](https://make.fun/badge/free-model-aggregator-02/JEPEHHH/makefun-aggregator/reward.svg)](https://make.fun/bounty/free-model-aggregator-02?utm_source=github&utm_medium=readme&utm_campaign=free-model-aggregator-02)
+
+
 One long-running server that answers both the OpenAI wire (`POST /v1/chat/completions`)
 and the Anthropic wire (`POST /v1/messages`), JSON and streaming, by dialling real free
 models through the trial's gateway. `GET /v1/models` answers in whichever wire the
