@@ -1043,6 +1043,27 @@ class Upstream:
                 pass
 
 
+def upstream_timeout() -> float:
+    """The per-call upstream deadline in seconds, clamped below the 30s pod limit."""
+    raw = os.environ.get('MAKEFUN_UPSTREAM_TIMEOUT', '')
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return float(UPSTREAM_TIMEOUT)
+    if not math.isfinite(value) or value <= 0:
+        return float(UPSTREAM_TIMEOUT)
+    return min(value, 29.0)
+
+
+def is_timeout(err: BaseException) -> bool:
+    """True when an upstream failure is a deadline, whichever layer raised it."""
+    if isinstance(err, (socket.timeout, TimeoutError)):
+        return True
+    if isinstance(err, urllib.error.URLError) and isinstance(err.reason, (socket.timeout, TimeoutError)):
+        return True
+    return False
+
+
 def dial(model: str, body: Json) -> Upstream:
     """POST one request to the gateway Chat Completions route with explicit timeout."""
     url = chat_completions_url()
@@ -1053,11 +1074,17 @@ def dial(model: str, body: Json) -> Upstream:
     if body.get('stream') is True:
         headers['accept'] = 'text/event-stream'
     request = urllib.request.Request(url, data=data, headers=headers, method='POST')
+    timeout = upstream_timeout()
     try:
-        response = urllib.request.urlopen(request, timeout=UPSTREAM_TIMEOUT)
+        response = urllib.request.urlopen(request, timeout=timeout)
         return Upstream(response.status, response)
     except urllib.error.HTTPError as err:
         return Upstream(err.code, err)
+    except Exception as err:
+        # A deadline before the first byte is one failed candidate, never a request that hangs
+        if is_timeout(err):
+            return Upstream(504, None, f'the gateway did not answer within {timeout:g}s')
+        raise
 
 
 def upstream_code(status: int, text: str) -> str:
@@ -1422,17 +1449,38 @@ def poll() -> None:
 # ---------------------------------------------------------------- Start & Main
 
 
-def stop(*_: object) -> None:
-    """SIGTERM and SIGINT handler: exit 0 cleanly and immediately."""
+SERVER: ThreadingHTTPServer | None = None
+stopping = threading.Event()
+
+
+def release_listener() -> None:
+    """Close the listening socket so the port is free the moment this process leaves."""
+    server = SERVER
+    if server is None:
+        return
     try:
+        server.socket.close()
+    except Exception:
+        pass
+
+
+def stop(*_: object) -> None:
+    """SIGTERM and SIGINT handler: exit 0 cleanly and immediately, exactly once."""
+    if stopping.is_set():
+        os._exit(0)
+    stopping.set()
+    try:
+        log('shutting down on signal')
         sys.stderr.flush()
         sys.stdout.flush()
     except Exception:
         pass
+    release_listener()
     os._exit(0)
 
 
 def start() -> None:
+    global SERVER
     if '--list' in sys.argv[1:]:
         # Print catalog JSON to stdout, exit 0 in < 10s without touching network
         sys.stdout.write(json.dumps(CATALOG, separators=(',', ':'), ensure_ascii=False) + '\n')
@@ -1447,6 +1495,7 @@ def start() -> None:
 
     server = ThreadingHTTPServer(('0.0.0.0', 0), Handler)
     server.daemon_threads = True
+    SERVER = server
     try:
         port = server.server_address[1]
         if port == 8080:
