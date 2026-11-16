@@ -511,7 +511,10 @@ export async function* openAIStreamWithModel(
           for (const c of chunk.choices) {
             if (isRecord(c)) {
               if (typeof c.finish_reason === 'string') {
-                sawFinish = true;
+                // An upstream that closes twice would make the trial read two finish chunks (stream_order
+                // fails, the whole prompt turns invalid): keep the first finish, blank the repeats.
+                if (sawFinish) c.finish_reason = null;
+                else sawFinish = true;
               }
               if (isRecord(c.delta)) {
                 if (typeof c.delta.content === 'string') completionChars += c.delta.content.length;
