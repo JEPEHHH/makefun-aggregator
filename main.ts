@@ -129,12 +129,17 @@ function servedModels(): ServedModel[] {
  * requirements by the brief's rating_milli (quality is 60% of the score) and prefer the best. This
  * baseline takes the first free model in the brief's order that meets the requirements.
  */
-function routeFor(requires: Requirement): ModelRow | null {
-  for (const model of freeModels(brief)) {
-    if (!meetsRequirements(requires, capabilitiesOf(model))) continue;
-    return model;
-  }
-  return null;
+const modelFailures = new Map<string, number>();
+
+function routeCandidates(requires: Requirement): ModelRow[] {
+  return freeModels(brief)
+    .filter((model) => meetsRequirements(requires, capabilitiesOf(model)))
+    .sort((a, b) => {
+      const failsA = modelFailures.get(a.id) ?? 0;
+      const failsB = modelFailures.get(b.id) ?? 0;
+      if (failsA !== failsB) return failsA - failsB;
+      return b.rating_milli - a.rating_milli;
+    });
 }
 
 /** The requirements of the prompt now arriving: the brief's row by arrival order, else the body's own. */
@@ -221,23 +226,27 @@ function refused(res: ServerResponse, wire: 'openai' | 'anthropic', status: numb
 async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJson(req);
   if (body === null) return sendError(res, 'openai', 400, 'invalid_request_error', 'the request body is not one JSON object');
-  const route = routeFor(requirementsFor(body));
-  if (route === null) return sendError(res, 'openai', 503, 'no_free_model', 'no free model in the brief meets this request');
-  let upstream: Response;
-  try {
-    upstream = await dial(route.id, { ...body, model: route.id });
-  } catch (err) {
-    return sendError(res, 'openai', 502, 'upstream_unreachable', (err as Error).message);
+  const candidates = routeCandidates(requirementsFor(body));
+  if (candidates.length === 0) return sendError(res, 'openai', 503, 'no_free_model', 'no free model in the brief meets this request');
+  let route: ModelRow = candidates[0];
+  let upstream: Response | null = null;
+  let failure: { status: number; text: string } = { status: 502, text: 'no candidate answered' };
+  for (const candidate of candidates) {
+    try {
+      const attempt = await dial(candidate.id, { ...body, model: candidate.id });
+      if (attempt.ok && attempt.body !== null) { upstream = attempt; route = candidate; break; }
+      failure = { status: attempt.status, text: await attempt.text() };
+      modelFailures.set(candidate.id, (modelFailures.get(candidate.id) ?? 0) + 1);
+    } catch (err) {
+      failure = { status: 502, text: (err as Error).message };
+      modelFailures.set(candidate.id, (modelFailures.get(candidate.id) ?? 0) + 1);
+    }
   }
-  if (!upstream.ok || upstream.body === null) {
-    // TODO(failover): a 4xx or 5xx here ends the prompt. Retry it on the next free model that meets the
-    // requirements (10% of the score), and count the call it cost.
-    return refused(res, 'openai', upstream.status, await upstream.text());
-  }
+  if (upstream === null) return refused(res, 'openai', failure.status, failure.text);
   if (body.stream === true) {
     res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
     try {
-      for await (const frame of openAIStreamWithModel(upstream.body, route.id, estimatePromptTokens(body))) res.write(frame);
+      for await (const frame of openAIStreamWithModel(upstream.body!, route.id, estimatePromptTokens(body))) res.write(frame);
     } finally {
       res.end();
     }
@@ -251,23 +260,27 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
 async function messages(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJson(req);
   if (body === null) return sendError(res, 'anthropic', 400, 'invalid_request_error', 'the request body is not one JSON object');
-  const route = routeFor(requirementsFor(body));
-  if (route === null) return sendError(res, 'anthropic', 503, 'overloaded_error', 'no free model in the brief meets this request');
-  let upstream: Response;
-  try {
-    upstream = await dial(route.id, anthropicToOpenAI(body, route.id));
-  } catch (err) {
-    return sendError(res, 'anthropic', 502, 'api_error', (err as Error).message);
+  const candidates = routeCandidates(requirementsFor(body));
+  if (candidates.length === 0) return sendError(res, 'anthropic', 503, 'overloaded_error', 'no free model in the brief meets this request');
+  let route: ModelRow = candidates[0];
+  let upstream: Response | null = null;
+  let failure: { status: number; text: string } = { status: 502, text: 'no candidate answered' };
+  for (const candidate of candidates) {
+    try {
+      const attempt = await dial(candidate.id, anthropicToOpenAI(body, candidate.id));
+      if (attempt.ok && attempt.body !== null) { upstream = attempt; route = candidate; break; }
+      failure = { status: attempt.status, text: await attempt.text() };
+      modelFailures.set(candidate.id, (modelFailures.get(candidate.id) ?? 0) + 1);
+    } catch (err) {
+      failure = { status: 502, text: (err as Error).message };
+      modelFailures.set(candidate.id, (modelFailures.get(candidate.id) ?? 0) + 1);
+    }
   }
-  if (!upstream.ok || upstream.body === null) {
-    // TODO(failover): a 4xx or 5xx here ends the prompt. Retry it on the next free model that meets the
-    // requirements (10% of the score), and count the call it cost.
-    return refused(res, 'anthropic', upstream.status, await upstream.text());
-  }
+  if (upstream === null) return refused(res, 'anthropic', failure.status, failure.text);
   if (body.stream === true) {
     res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
     try {
-      for await (const event of anthropicEventsFromOpenAI(upstream.body, route.id, estimatePromptTokens(body))) res.write(event);
+      for await (const event of anthropicEventsFromOpenAI(upstream.body!, route.id, estimatePromptTokens(body))) res.write(event);
     } finally {
       res.end();
     }
