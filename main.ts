@@ -185,10 +185,36 @@ async function readJson(req: IncomingMessage): Promise<Json | null> {
   }
 }
 
-function sendJson(res: ServerResponse, status: number, body: unknown): void {
+function sendJson(res: ServerResponse, status: number, body: unknown, extra: Record<string, string> = {}): void {
   const text = JSON.stringify(body);
-  res.writeHead(status, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(text) });
+  res.writeHead(status, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(text), ...extra });
   res.end(text);
+}
+
+/** One refused gateway call, as the failover trail reports it. */
+type UpstreamFailure = { status: number; code: string; model: string | null };
+
+/** The client-visible code for a refusal: the provider's own code, else the HTTP status. */
+function upstreamCode(status: number, text: string): string {
+  try {
+    const parsed: unknown = JSON.parse(text);
+    if (isRecord(parsed)) {
+      const error = parsed.error;
+      if (isRecord(error) && typeof error.code === 'string' && error.code !== '') return error.code;
+      if (isRecord(error) && typeof error.type === 'string' && error.type !== '') return error.type;
+      if (typeof parsed.code === 'string' && parsed.code !== '') return parsed.code;
+    }
+  } catch {
+    /* not JSON: fall through to the status */
+  }
+  return `http_${status}`;
+}
+
+/** `x-makefun-upstream-failures`, the only channel the failover column reads a recovered refusal from. */
+function failureTrail(trail: UpstreamFailure[]): Record<string, string> {
+  if (trail.length === 0 || process.env.BIMA_TRAIL !== '1') return {};
+  const value = JSON.stringify(trail.slice(0, 8));
+  return Buffer.byteLength(value) > 8192 ? {} : { 'x-makefun-upstream-failures': value };
 }
 
 function sendError(res: ServerResponse, wire: 'openai' | 'anthropic', status: number, type: string, message: string): void {
@@ -231,20 +257,24 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
   let route: ModelRow = candidates[0];
   let upstream: Response | null = null;
   let failure: { status: number; text: string } = { status: 502, text: 'no candidate answered' };
+  const trail: UpstreamFailure[] = [];
   for (const candidate of candidates) {
     try {
       const attempt = await dial(candidate.id, { ...body, model: candidate.id });
       if (attempt.ok && attempt.body !== null) { upstream = attempt; route = candidate; break; }
       failure = { status: attempt.status, text: await attempt.text() };
+      trail.push({ status: attempt.status, code: upstreamCode(attempt.status, failure.text), model: candidate.id });
       modelFailures.set(candidate.id, (modelFailures.get(candidate.id) ?? 0) + 1);
     } catch (err) {
       failure = { status: 502, text: (err as Error).message };
+      trail.push({ status: 502, code: 'upstream_error', model: candidate.id });
       modelFailures.set(candidate.id, (modelFailures.get(candidate.id) ?? 0) + 1);
     }
   }
   if (upstream === null) return refused(res, 'openai', failure.status, failure.text);
+  const recovered = failureTrail(trail);
   if (body.stream === true) {
-    res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
+    res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive', ...recovered });
     try {
       for await (const frame of openAIStreamWithModel(upstream.body!, route.id, estimatePromptTokens(body))) res.write(frame);
     } finally {
@@ -253,7 +283,7 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
     return;
   }
   const answer: unknown = await upstream.json();
-  sendJson(res, 200, openAIJsonWithModel(isRecord(answer) ? answer : {}, route.id, estimatePromptTokens(body)));
+  sendJson(res, 200, openAIJsonWithModel(isRecord(answer) ? answer : {}, route.id, estimatePromptTokens(body)), recovered);
 }
 
 /** POST /v1/messages: an Anthropic-shaped client, rewritten to Chat Completions and answered back. */
@@ -265,20 +295,24 @@ async function messages(req: IncomingMessage, res: ServerResponse): Promise<void
   let route: ModelRow = candidates[0];
   let upstream: Response | null = null;
   let failure: { status: number; text: string } = { status: 502, text: 'no candidate answered' };
+  const trail: UpstreamFailure[] = [];
   for (const candidate of candidates) {
     try {
       const attempt = await dial(candidate.id, anthropicToOpenAI(body, candidate.id));
       if (attempt.ok && attempt.body !== null) { upstream = attempt; route = candidate; break; }
       failure = { status: attempt.status, text: await attempt.text() };
+      trail.push({ status: attempt.status, code: upstreamCode(attempt.status, failure.text), model: candidate.id });
       modelFailures.set(candidate.id, (modelFailures.get(candidate.id) ?? 0) + 1);
     } catch (err) {
       failure = { status: 502, text: (err as Error).message };
+      trail.push({ status: 502, code: 'upstream_error', model: candidate.id });
       modelFailures.set(candidate.id, (modelFailures.get(candidate.id) ?? 0) + 1);
     }
   }
   if (upstream === null) return refused(res, 'anthropic', failure.status, failure.text);
+  const recovered = failureTrail(trail);
   if (body.stream === true) {
-    res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
+    res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive', ...recovered });
     try {
       for await (const event of anthropicEventsFromOpenAI(upstream.body!, route.id, estimatePromptTokens(body))) res.write(event);
     } finally {
@@ -287,7 +321,7 @@ async function messages(req: IncomingMessage, res: ServerResponse): Promise<void
     return;
   }
   const answer: unknown = await upstream.json();
-  sendJson(res, 200, openAIToAnthropic(isRecord(answer) ? answer : {}, route.id, estimatePromptTokens(body)));
+  sendJson(res, 200, openAIToAnthropic(isRecord(answer) ? answer : {}, route.id, estimatePromptTokens(body)), recovered);
 }
 
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
