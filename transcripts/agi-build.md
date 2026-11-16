@@ -1,1 +1,0 @@
-(log AGI tidak tersedia)
