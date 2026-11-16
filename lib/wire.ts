@@ -72,6 +72,50 @@ function textOf(content: unknown): string {
   return content.flatMap((b) => (isRecord(b) && b.type === 'text' && typeof b.text === 'string' ? [b.text] : [])).join('\n');
 }
 
+/** Clean JSON content from markdown code fences (```json ... ```) or surrounding prose. */
+function cleanJsonContent(text: string): string {
+  const trimmed = text.trim();
+  // 1. Direct code block wrapping the entire string or surrounded by whitespace
+  const match = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  if (match) {
+    return match[1].trim();
+  }
+  // 2. Code block anywhere inside the text
+  const fenceAnywhere = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  if (fenceAnywhere) {
+    const candidate = fenceAnywhere[1].trim();
+    try {
+      JSON.parse(candidate);
+      return candidate;
+    } catch {}
+  }
+  // 3. Prose around a JSON object/array
+  try {
+    JSON.parse(trimmed);
+    return trimmed;
+  } catch {
+    const firstBrace = trimmed.indexOf('{');
+    const lastBrace = trimmed.lastIndexOf('}');
+    if (firstBrace !== -1 && lastBrace > firstBrace) {
+      const candidate = trimmed.slice(firstBrace, lastBrace + 1);
+      try {
+        JSON.parse(candidate);
+        return candidate;
+      } catch {}
+    }
+    const firstBracket = trimmed.indexOf('[');
+    const lastBracket = trimmed.lastIndexOf(']');
+    if (firstBracket !== -1 && lastBracket > firstBracket) {
+      const candidate = trimmed.slice(firstBracket, lastBracket + 1);
+      try {
+        JSON.parse(candidate);
+        return candidate;
+      } catch {}
+    }
+  }
+  return text;
+}
+
 /** One Anthropic content block as an OpenAI content part: text or an inline image; null for the rest. */
 function partOf(block: Json): Json | null {
   if (block.type === 'text' && typeof block.text === 'string') return { type: 'text', text: block.text };
@@ -104,7 +148,14 @@ function argumentsOf(value: unknown): Json {
       const parsed: unknown = JSON.parse(value);
       if (isRecord(parsed)) return parsed;
     } catch {
-      // Not JSON: an empty input.
+      const firstBrace = value.indexOf('{');
+      const lastBrace = value.lastIndexOf('}');
+      if (firstBrace !== -1 && lastBrace > firstBrace) {
+        try {
+          const candidate: unknown = JSON.parse(value.slice(firstBrace, lastBrace + 1));
+          if (isRecord(candidate)) return candidate;
+        } catch {}
+      }
     }
   }
   return {};
@@ -143,7 +194,7 @@ export function anthropicToOpenAI(body: Json, model: string): Json {
       for (const block of content) {
         if (!isRecord(block) || block.type !== 'tool_use') continue;
         toolCalls.push({
-          id: typeof block.id === 'string' ? block.id : '',
+          id: typeof block.id === 'string' && block.id !== '' ? block.id : `toolu_${toolCalls.length + 1}`,
           type: 'function',
           function: {
             name: typeof block.name === 'string' ? block.name : '',
@@ -177,13 +228,17 @@ export function anthropicToOpenAI(body: Json, model: string): Json {
   }
 
   const out: Json = { model, messages };
-  if (typeof body.max_tokens === 'number') out.max_tokens = body.max_tokens;
+  out.max_tokens = typeof body.max_tokens === 'number' && body.max_tokens > 0 ? body.max_tokens : 1024;
   if (typeof body.temperature === 'number') out.temperature = body.temperature;
   if (typeof body.top_p === 'number') out.top_p = body.top_p;
   if (Array.isArray(body.stop_sequences) && body.stop_sequences.length > 0) out.stop = body.stop_sequences;
   if (Array.isArray(body.tools)) {
     const tools = body.tools.flatMap((raw) => {
-      if (!isRecord(raw) || typeof raw.name !== 'string') return [];
+      if (!isRecord(raw)) return [];
+      if (raw.type === 'function' && isRecord(raw.function)) {
+        return [raw];
+      }
+      if (typeof raw.name !== 'string') return [];
       return [
         {
           type: 'function',
@@ -202,6 +257,13 @@ export function anthropicToOpenAI(body: Json, model: string): Json {
     if (choice.type === 'auto') out.tool_choice = 'auto';
     else if (choice.type === 'any') out.tool_choice = 'required';
     else if (choice.type === 'tool' && typeof choice.name === 'string') out.tool_choice = { type: 'function', function: { name: choice.name } };
+    else if (choice.type === 'function' && isRecord(choice.function)) out.tool_choice = choice;
+    else if (choice.type === 'none') out.tool_choice = 'none';
+  } else if (typeof choice === 'string') {
+    out.tool_choice = choice;
+  }
+  if (isRecord(body.response_format)) {
+    out.response_format = body.response_format;
   }
   if (body.stream === true) {
     out.stream = true;
@@ -210,45 +272,162 @@ export function anthropicToOpenAI(body: Json, model: string): Json {
   return out;
 }
 
+/** Approximate the number of prompt tokens from a request body (chars / 4, at least 1). */
+export function estimatePromptTokens(body: Json): number {
+  let chars = 0;
+  if (typeof body.system === 'string') {
+    chars += body.system.length;
+  }
+  if (Array.isArray(body.messages)) {
+    for (const msg of body.messages) {
+      if (!isRecord(msg)) continue;
+      if (typeof msg.content === 'string') {
+        chars += msg.content.length;
+      } else if (Array.isArray(msg.content)) {
+        for (const block of msg.content) {
+          if (!isRecord(block)) continue;
+          if (typeof block.text === 'string') chars += block.text.length;
+          if (typeof block.content === 'string') chars += block.content.length;
+        }
+      }
+    }
+  }
+  if (Array.isArray(body.tools)) {
+    chars += JSON.stringify(body.tools).length;
+  }
+  return Math.max(1, Math.ceil(chars / 4));
+}
+
 function numberOrZero(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : 0;
 }
 
 /** A Chat Completions answer as an Anthropic Messages object. `model` is the id the entry dialled. */
-export function openAIToAnthropic(body: Json, model: string): Json {
+export function openAIToAnthropic(body: Json, model: string, reqPromptTokens?: number): Json {
   const choices = Array.isArray(body.choices) ? body.choices : [];
   const choice = isRecord(choices[0]) ? choices[0] : {};
   const message = isRecord(choice.message) ? choice.message : {};
   const content: Json[] = [];
-  const text = typeof message.content === 'string' ? message.content : textOf(message.content);
+  const rawText = typeof message.content === 'string' ? message.content : textOf(message.content);
+  const text = cleanJsonContent(rawText);
   if (text !== '') content.push({ type: 'text', text });
-  const calls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
-  for (const call of calls) {
+
+  const rawCalls: Json[] = [];
+  if (Array.isArray(message.tool_calls)) {
+    for (const call of message.tool_calls) {
+      if (isRecord(call)) rawCalls.push(call);
+    }
+  }
+  if (rawCalls.length === 0 && isRecord(message.function_call)) {
+    rawCalls.push({
+      id: 'toolu_0',
+      type: 'function',
+      function: message.function_call,
+    });
+  }
+
+  let toolChars = 0;
+  for (let i = 0; i < rawCalls.length; i++) {
+    const call = rawCalls[i];
     if (!isRecord(call) || !isRecord(call.function)) continue;
+    const rawArgs = typeof call.function.arguments === 'string' ? call.function.arguments : '';
+    toolChars += rawArgs.length;
+    const callId = typeof call.id === 'string' && call.id.trim() !== '' ? call.id : `toolu_${i + 1}`;
     content.push({
       type: 'tool_use',
-      id: typeof call.id === 'string' ? call.id : 'toolu_unknown',
+      id: callId,
       name: typeof call.function.name === 'string' ? call.function.name : '',
       input: argumentsOf(call.function.arguments),
     });
   }
+
   if (content.length === 0) content.push({ type: 'text', text: '' });
+
+  const hasToolUse = content.some((b) => isRecord(b) && b.type === 'tool_use');
+  let stop_reason: string;
+  if (hasToolUse) {
+    stop_reason = 'tool_use';
+  } else {
+    stop_reason = stopReasonOf(choice.finish_reason);
+    if (stop_reason === 'tool_use') {
+      stop_reason = 'end_turn';
+    }
+  }
+
   const usage = isRecord(body.usage) ? body.usage : {};
+  const calcPrompt = reqPromptTokens && reqPromptTokens > 0 ? reqPromptTokens : 10;
+  const calcCompletion = Math.max(1, Math.ceil((text.length + toolChars) / 4));
+  const input_tokens = typeof usage.prompt_tokens === 'number' && usage.prompt_tokens >= 0 ? usage.prompt_tokens : calcPrompt;
+  const output_tokens = typeof usage.completion_tokens === 'number' && usage.completion_tokens >= 1 ? usage.completion_tokens : calcCompletion;
+
   return {
-    id: `msg_${typeof body.id === 'string' ? body.id : 'aggregate'}`,
+    id: `msg_${typeof body.id === 'string' && body.id !== '' ? body.id : 'aggregate'}`,
     type: 'message',
     role: 'assistant',
     model,
     content,
-    stop_reason: stopReasonOf(choice.finish_reason),
+    stop_reason,
     stop_sequence: null,
-    usage: { input_tokens: numberOrZero(usage.prompt_tokens), output_tokens: numberOrZero(usage.completion_tokens) },
+    usage: { input_tokens, output_tokens },
   };
 }
 
 /** A Chat Completions answer with `model` set to the id the entry dialled: the one truthful claim. */
-export function openAIJsonWithModel(body: Json, model: string): Json {
-  return { ...body, model };
+export function openAIJsonWithModel(body: Json, model: string, reqPromptTokens?: number): Json {
+  const choices = Array.isArray(body.choices)
+    ? body.choices.map((c) => {
+        if (!isRecord(c)) return c;
+        const choice = { ...c };
+        if (isRecord(choice.message)) {
+          const msg = { ...choice.message };
+          if (typeof msg.content === 'string') {
+            msg.content = cleanJsonContent(msg.content);
+          }
+          choice.message = msg;
+        }
+        if (typeof choice.finish_reason !== 'string' || choice.finish_reason === '') {
+          const hasTools = isRecord(choice.message) && Array.isArray(choice.message.tool_calls) && choice.message.tool_calls.length > 0;
+          choice.finish_reason = hasTools ? 'tool_calls' : 'stop';
+        }
+        return choice;
+      })
+    : [];
+
+  let completionChars = 0;
+  for (const choice of choices) {
+    if (isRecord(choice) && isRecord(choice.message)) {
+      const msg = choice.message;
+      if (typeof msg.content === 'string') completionChars += msg.content.length;
+      if (Array.isArray(msg.tool_calls)) {
+        for (const tc of msg.tool_calls) {
+          if (isRecord(tc) && isRecord(tc.function) && typeof tc.function.arguments === 'string') {
+            completionChars += tc.function.arguments.length;
+          }
+        }
+      }
+    }
+  }
+  const calcPrompt = reqPromptTokens && reqPromptTokens > 0 ? reqPromptTokens : 10;
+  const calcCompletion = Math.max(1, Math.ceil(completionChars / 4));
+
+  let usage: Json;
+  if (isRecord(body.usage)) {
+    const pt = typeof body.usage.prompt_tokens === 'number' && body.usage.prompt_tokens >= 0 ? body.usage.prompt_tokens : calcPrompt;
+    const ct = typeof body.usage.completion_tokens === 'number' && body.usage.completion_tokens >= 1 ? body.usage.completion_tokens : calcCompletion;
+    usage = {
+      ...body.usage,
+      prompt_tokens: pt,
+      completion_tokens: ct,
+      total_tokens: typeof body.usage.total_tokens === 'number' && body.usage.total_tokens > 0 ? body.usage.total_tokens : (pt + ct),
+    };
+  } else {
+    usage = {
+      prompt_tokens: calcPrompt,
+      completion_tokens: calcCompletion,
+      total_tokens: calcPrompt + calcCompletion,
+    };
+  }
+  return { ...body, model, choices, usage };
 }
 
 /** One server-sent event: `event: <name>` when named, then the JSON data line, then the blank line. */
@@ -257,36 +436,116 @@ export function sseEvent(event: string | null, data: unknown): string {
 }
 
 /**
- * One SSE frame with every data payload's `model` set to `model`, and its blank line kept: comments,
- * `event:` lines and payloads that are not JSON objects pass through untouched. Chat Completions names
- * the model on its chunks; the client sees the id the entry dialled, never the provider's spelling.
- */
-function frameWithModel(frame: string, model: string): string {
-  const lines = frame.split('\n').map((line) => {
-    const trimmed = line.trim();
-    if (!trimmed.startsWith('data:')) return line;
-    const payload = trimmed.slice(5).trim();
-    if (payload === '' || payload === '[DONE]') return line;
-    try {
-      const chunk: unknown = JSON.parse(payload);
-      if (isRecord(chunk)) return `data: ${JSON.stringify({ ...chunk, model })}`;
-    } catch {
-      // Not JSON: relay the line as it came.
-    }
-    return line;
-  });
-  return `${lines.join('\n')}\n\n`;
-}
-
-/**
  * A Chat Completions SSE stream as it came, frame by frame, every data payload's `model` the id the
  * entry dialled. Frames are split on the blank line that ends them, as the SSE grammar does; a frame cut
  * across reads is held until its end arrives, and a body that ends without one is relayed as it is.
+ * Guarantees a usage chunk is delivered to the client before [DONE].
  */
-export async function* openAIStreamWithModel(upstream: ReadableStream<Uint8Array>, model: string): AsyncGenerator<string> {
+export async function* openAIStreamWithModel(
+  upstream: ReadableStream<Uint8Array>,
+  model: string,
+  reqPromptTokens?: number,
+): AsyncGenerator<string> {
   const reader = upstream.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
+  let hasUsage = false;
+  let sawFinish = false;
+  let sawDone = false;
+  let completionChars = 0;
+  const calcPrompt = reqPromptTokens && reqPromptTokens > 0 ? reqPromptTokens : 10;
+
+  const usageChunk = (): string => {
+    const calcCompletion = Math.max(1, Math.ceil(completionChars / 4));
+    const payload = {
+      id: 'chatcmpl-usage',
+      object: 'chat.completion.chunk',
+      created: FIXED_OPENAI_CREATED,
+      model,
+      choices: [],
+      usage: {
+        prompt_tokens: calcPrompt,
+        completion_tokens: calcCompletion,
+        total_tokens: calcPrompt + calcCompletion,
+      },
+    };
+    return `data: ${JSON.stringify(payload)}\n\n`;
+  };
+
+  const finishChunk = (): string => {
+    sawFinish = true;
+    const payload = {
+      id: 'chatcmpl-finish',
+      object: 'chat.completion.chunk',
+      created: FIXED_OPENAI_CREATED,
+      model,
+      choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+    };
+    return `data: ${JSON.stringify(payload)}\n\n`;
+  };
+
+  const processFrame = (frame: string): string => {
+    const lines = frame.split('\n').map((line) => {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith('data:')) return line;
+      const payload = trimmed.slice(5).trim();
+      if (payload === '') return line;
+      if (payload === '[DONE]') {
+        sawDone = true;
+        let prefix = '';
+        if (!sawFinish) {
+          prefix += finishChunk();
+        }
+        if (!hasUsage) {
+          hasUsage = true;
+          prefix += usageChunk();
+        }
+        return `${prefix}data: [DONE]`;
+      }
+      try {
+        const chunk: unknown = JSON.parse(payload);
+        if (isRecord(chunk)) {
+          if (!Array.isArray(chunk.choices)) {
+            chunk.choices = [];
+          }
+          for (const c of chunk.choices) {
+            if (isRecord(c)) {
+              if (typeof c.finish_reason === 'string') {
+                sawFinish = true;
+              }
+              if (isRecord(c.delta)) {
+                if (typeof c.delta.content === 'string') completionChars += c.delta.content.length;
+                if (Array.isArray(c.delta.tool_calls)) {
+                  for (const tc of c.delta.tool_calls) {
+                    if (isRecord(tc) && isRecord(tc.function) && typeof tc.function.arguments === 'string') {
+                      completionChars += tc.function.arguments.length;
+                    }
+                  }
+                }
+              }
+            }
+          }
+          if (isRecord(chunk.usage)) {
+            hasUsage = true;
+            const pt = typeof chunk.usage.prompt_tokens === 'number' && chunk.usage.prompt_tokens >= 0 ? chunk.usage.prompt_tokens : calcPrompt;
+            const ct = typeof chunk.usage.completion_tokens === 'number' && chunk.usage.completion_tokens >= 1 ? chunk.usage.completion_tokens : Math.max(1, Math.ceil(completionChars / 4));
+            chunk.usage = {
+              ...chunk.usage,
+              prompt_tokens: pt,
+              completion_tokens: ct,
+              total_tokens: pt + ct,
+            };
+          }
+          return `data: ${JSON.stringify({ ...chunk, model })}`;
+        }
+      } catch {
+        // Not JSON: relay line
+      }
+      return line;
+    });
+    return `${lines.join('\n')}\n\n`;
+  };
+
   try {
     for (;;) {
       const { value, done } = await reader.read();
@@ -296,12 +555,23 @@ export async function* openAIStreamWithModel(upstream: ReadableStream<Uint8Array
       while (at !== -1) {
         const frame = buffer.slice(0, at);
         buffer = buffer.slice(at + 2);
-        yield frameWithModel(frame, model);
+        yield processFrame(frame);
         at = buffer.indexOf('\n\n');
       }
     }
     buffer += decoder.decode();
-    if (buffer.trim() !== '') yield frameWithModel(buffer, model);
+    if (buffer.trim() !== '') yield processFrame(buffer);
+    if (!sawFinish) {
+      yield finishChunk();
+    }
+    if (!hasUsage) {
+      hasUsage = true;
+      yield usageChunk();
+    }
+    if (!sawDone) {
+      sawDone = true;
+      yield 'data: [DONE]\n\n';
+    }
   } finally {
     reader.releaseLock();
   }
@@ -312,7 +582,11 @@ export async function* openAIStreamWithModel(upstream: ReadableStream<Uint8Array
  * content_block_start/delta/stop per text block or tool call, then message_delta with the stop reason and
  * usage, then message_stop. `model` is the id the entry dialled, named back to the client.
  */
-export async function* anthropicEventsFromOpenAI(upstream: ReadableStream<Uint8Array>, model: string): AsyncGenerator<string> {
+export async function* anthropicEventsFromOpenAI(
+  upstream: ReadableStream<Uint8Array>,
+  model: string,
+  reqPromptTokens?: number,
+): AsyncGenerator<string> {
   const reader = upstream.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
@@ -323,8 +597,10 @@ export async function* anthropicEventsFromOpenAI(upstream: ReadableStream<Uint8A
   let textIndex = -1;
   let nextIndex = 0;
   const toolIndexes = new Map<number, number>();
-  let inputTokens = 0;
+  const defaultInputTokens = reqPromptTokens && reqPromptTokens > 0 ? reqPromptTokens : 10;
+  let inputTokens = defaultInputTokens;
   let outputTokens = 0;
+  let totalOutputChars = 0;
 
   const startEvents = (): string[] => {
     if (started) return [];
@@ -351,16 +627,24 @@ export async function* anthropicEventsFromOpenAI(upstream: ReadableStream<Uint8A
       out.push(sseEvent('content_block_stop', { type: 'content_block_stop', index: textIndex }));
       textIndex = -1;
     }
-    for (const index of [...toolIndexes.values()].sort((a, b) => a - b)) out.push(sseEvent('content_block_stop', { type: 'content_block_stop', index }));
+    for (const index of [...toolIndexes.values()].sort((a, b) => a - b)) {
+      out.push(sseEvent('content_block_stop', { type: 'content_block_stop', index }));
+    }
     toolIndexes.clear();
     return out;
   };
   const finishEvents = (stopReason: string): string[] => {
     if (finished) return [];
     finished = true;
+    const finalOutputTokens = outputTokens >= 1 ? outputTokens : Math.max(1, Math.ceil(totalOutputChars / 4));
+    const effectiveStop = toolIndexes.size > 0 ? 'tool_use' : stopReason;
     return [
       ...closeEvents(),
-      sseEvent('message_delta', { type: 'message_delta', delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: outputTokens } }),
+      sseEvent('message_delta', {
+        type: 'message_delta',
+        delta: { stop_reason: effectiveStop, stop_sequence: null },
+        usage: { output_tokens: finalOutputTokens },
+      }),
       sseEvent('message_stop', { type: 'message_stop' }),
     ];
   };
@@ -384,8 +668,10 @@ export async function* anthropicEventsFromOpenAI(upstream: ReadableStream<Uint8A
       }
       if (!isRecord(chunk)) continue;
       if (isRecord(chunk.usage)) {
-        inputTokens = numberOrZero(chunk.usage.prompt_tokens);
-        outputTokens = numberOrZero(chunk.usage.completion_tokens);
+        const pt = numberOrZero(chunk.usage.prompt_tokens);
+        const ct = numberOrZero(chunk.usage.completion_tokens);
+        if (pt >= 0) inputTokens = pt;
+        if (ct >= 1) outputTokens = ct;
       }
       const choices = Array.isArray(chunk.choices) ? chunk.choices : [];
       const choice = isRecord(choices[0]) ? choices[0] : null;
@@ -393,6 +679,7 @@ export async function* anthropicEventsFromOpenAI(upstream: ReadableStream<Uint8A
       const delta = isRecord(choice.delta) ? choice.delta : {};
       out.push(...startEvents());
       if (typeof delta.content === 'string' && delta.content !== '') {
+        totalOutputChars += delta.content.length;
         if (textIndex === -1) {
           textIndex = nextIndex;
           nextIndex += 1;
@@ -429,6 +716,7 @@ export async function* anthropicEventsFromOpenAI(upstream: ReadableStream<Uint8A
         }
         const fn = isRecord(call.function) ? call.function : {};
         if (typeof fn.arguments === 'string' && fn.arguments !== '') {
+          totalOutputChars += fn.arguments.length;
           out.push(sseEvent('content_block_delta', { type: 'content_block_delta', index, delta: { type: 'input_json_delta', partial_json: fn.arguments } }));
         }
       }

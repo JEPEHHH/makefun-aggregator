@@ -79,6 +79,7 @@ import {
   anthropicEventsFromOpenAI,
   anthropicModelList,
   anthropicToOpenAI,
+  estimatePromptTokens,
   openAIError,
   openAIJsonWithModel,
   openAIModelList,
@@ -236,14 +237,14 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
   if (body.stream === true) {
     res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
     try {
-      for await (const frame of openAIStreamWithModel(upstream.body, route.id)) res.write(frame);
+      for await (const frame of openAIStreamWithModel(upstream.body, route.id, estimatePromptTokens(body))) res.write(frame);
     } finally {
       res.end();
     }
     return;
   }
   const answer: unknown = await upstream.json();
-  sendJson(res, 200, openAIJsonWithModel(isRecord(answer) ? answer : {}, route.id));
+  sendJson(res, 200, openAIJsonWithModel(isRecord(answer) ? answer : {}, route.id, estimatePromptTokens(body)));
 }
 
 /** POST /v1/messages: an Anthropic-shaped client, rewritten to Chat Completions and answered back. */
@@ -266,14 +267,14 @@ async function messages(req: IncomingMessage, res: ServerResponse): Promise<void
   if (body.stream === true) {
     res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
     try {
-      for await (const event of anthropicEventsFromOpenAI(upstream.body, route.id)) res.write(event);
+      for await (const event of anthropicEventsFromOpenAI(upstream.body, route.id, estimatePromptTokens(body))) res.write(event);
     } finally {
       res.end();
     }
     return;
   }
   const answer: unknown = await upstream.json();
-  sendJson(res, 200, openAIToAnthropic(isRecord(answer) ? answer : {}, route.id));
+  sendJson(res, 200, openAIToAnthropic(isRecord(answer) ? answer : {}, route.id, estimatePromptTokens(body)));
 }
 
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
